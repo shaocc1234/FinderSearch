@@ -31,6 +31,7 @@ import AppKit
             }
             table.addTableColumn(column)
         }
+        table.configureColumns()
         table.target = coordinator; table.doubleAction = #selector(Coordinator.openClicked)
         table.dragExit = { [weak model = model] in model?.springLoader.cancel() }
         table.menuProvider = { [weak coordinator = coordinator] row in coordinator?.menu(for: row) }
@@ -115,8 +116,7 @@ import AppKit
             if renameField?.editingPath != nil { renameField?.cancelEditing() }
             updating = true; defer { updating = false }
             let next = parent.model.sortedHits
-            table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("where"))?.isHidden =
-                !parent.model.isSearch
+            table.isSearch = parent.model.isSearch
             if items != next {
                 items = next;
                 rowByPath = Dictionary(
@@ -308,6 +308,10 @@ import AppKit
                 return item
             }
             menu.autoenablesItems = false
+            let columns = NSMenuItem(title: "Show Columns", action: nil, keyEquivalent: "")
+            columns.submenu = table.columnsMenu()
+            menu.addItem(columns)
+            menu.addItem(.separator())
             if !items.indices.contains(row) {
                 let writable = model.canWriteHere && !model.busy
                 add("New Folder", enabled: writable) { model.newFolder() }
@@ -387,7 +391,69 @@ import AppKit
     }
 }
 
-@MainActor final class BrowserTable: NSTableView {
+@MainActor final class BrowserTable: NSTableView, NSMenuDelegate {
+    static let columnVisibilityKey = "listColumnVisibility.v1"
+    private static let columnsChanged = Notification.Name("FinderSearch.listColumnsChanged")
+    private var columnDefaults = UserDefaults.standard
+    private var columnObserver: NSObjectProtocol?
+    var isSearch = false {
+        didSet { if oldValue != isSearch { applyColumnVisibility() } }
+    }
+
+    func configureColumns(defaults: UserDefaults = .standard) {
+        columnDefaults = defaults
+        if let columnObserver { NotificationCenter.default.removeObserver(columnObserver) }
+        columnObserver = NotificationCenter.default.addObserver(
+            forName: Self.columnsChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.applyColumnVisibility() }
+        }
+        applyColumnVisibility()
+        headerView?.menu = columnsMenu()
+    }
+
+    private func applyColumnVisibility() {
+        let saved = columnDefaults.dictionary(forKey: Self.columnVisibilityKey) as? [String: Bool] ?? [:]
+        for column in tableColumns {
+            let key = column.identifier.rawValue
+            let visible = key == "name" || (saved[key] ?? (key != "where" || isSearch))
+            if column.isHidden == visible { column.isHidden = !visible }
+        }
+    }
+
+    func columnsMenu() -> NSMenu {
+        let menu = NSMenu(); menu.autoenablesItems = false; menu.delegate = self
+        for column in tableColumns {
+            let item = NSMenuItem(title: column.title, action: #selector(toggleColumn(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = column.identifier.rawValue
+            item.isEnabled = column.identifier.rawValue != "name"
+            item.state = column.isHidden ? .off : .on
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        for item in menu.items {
+            guard let key = item.representedObject as? String,
+                let column = tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(key)) else { continue }
+            item.state = column.isHidden ? .off : .on
+        }
+    }
+
+    @objc private func toggleColumn(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String, key != "name",
+            let column = tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(key)) else { return }
+        var saved = columnDefaults.dictionary(forKey: Self.columnVisibilityKey) as? [String: Bool] ?? [:]
+        saved[key] = column.isHidden
+        columnDefaults.set(saved, forKey: Self.columnVisibilityKey)
+        NotificationCenter.default.post(name: Self.columnsChanged, object: nil)
+    }
+
+    deinit {
+        if let columnObserver { NotificationCenter.default.removeObserver(columnObserver) }
+    }
+
     let marquee = MarqueeSelectionView()
     var menuProvider: ((Int) -> NSMenu?)?
     var dragExit: (() -> Void)?
