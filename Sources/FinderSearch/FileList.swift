@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreServices
 
 /// Fixed-height AppKit rows avoid SwiftUI Table's automatic-height diffing work
 /// when hundreds of search results are replaced by a cached folder listing.
@@ -21,12 +22,15 @@ import AppKit
         table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         for (key, title, width, minimum) in [
             ("name", "Name", 300.0, 180.0), ("modified", "Date Modified", 180.0, 145.0),
+            ("created", "Date Created", 180.0, 145.0),
+            ("opened", "Date Last Opened", 180.0, 145.0),
+            ("added", "Date Added", 180.0, 145.0),
             ("size", "Size", 85.0, 70.0), ("kind", "Kind", 130.0, 90.0),
             ("where", "Where", 200.0, 130.0),
         ] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
             column.title = title; column.width = width; column.minWidth = minimum
-            if key != "where" {
+            if ["name", "modified", "size", "kind"].contains(key) {
                 column.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: true)
             }
             table.addTableColumn(column)
@@ -188,6 +192,7 @@ import AppKit
             let cell =
                 tableView.makeView(withIdentifier: tableColumn.identifier, owner: self) as? FileCell
                 ?? FileCell(identifier: tableColumn.identifier, withIcon: key == "name")
+            cell.dateTask?.cancel(); cell.dateTask = nil
             cell.path = hit.path
             cell.alphaValue = parent.clipboard.opacity(for: hit.path)
             switch key {
@@ -196,6 +201,17 @@ import AppKit
                 cell.textField?.stringValue =
                     hit.metadataPending == true
                     ? "—" : Self.dateFormatter.string(from: hit.modified)
+            case "created", "opened", "added":
+                cell.textField?.stringValue = "—"
+                if hit.metadataPending != true {
+                    cell.dateTask = Task { @MainActor [weak cell] in
+                        let date = await Task.detached(priority: .utility) {
+                            FileCell.fileDate(at: hit.url, column: key)
+                        }.value
+                        guard !Task.isCancelled, let cell, cell.path == hit.path else { return }
+                        cell.textField?.stringValue = date.map { Self.dateFormatter.string(from: $0) } ?? "—"
+                    }
+                }
             case "size":
                 cell.textField?.stringValue =
                     hit.kind == "dir" || hit.metadataPending == true
@@ -416,7 +432,8 @@ import AppKit
         let saved = columnDefaults.dictionary(forKey: Self.columnVisibilityKey) as? [String: Bool] ?? [:]
         for column in tableColumns {
             let key = column.identifier.rawValue
-            let visible = key == "name" || (saved[key] ?? (key != "where" || isSearch))
+            let defaultVisible = key == "where" ? isSearch : !["created", "opened", "added"].contains(key)
+            let visible = key == "name" || (saved[key] ?? defaultVisible)
             if column.isHidden == visible { column.isHidden = !visible }
         }
     }
@@ -471,6 +488,21 @@ import AppKit
 @MainActor final class FileCell: NSTableCellView {
     var path = ""
     var iconTask: Task<Void, Never>?
+    var dateTask: Task<Void, Never>?
+
+    nonisolated static func fileDate(at url: URL, column: String) -> Date? {
+        if column == "created" {
+            return (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+        }
+        // Finder's added/last-opened dates are Spotlight metadata; filesystem
+        // access time changes during background reads and is not a substitute.
+        guard let item = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL) else { return nil }
+        switch column {
+        case "added": return MDItemCopyAttribute(item, kMDItemDateAdded) as? Date
+        case "opened": return MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date
+        default: return nil
+        }
+    }
     private(set) var tagView: FileTagView?
     init(identifier: NSUserInterfaceItemIdentifier, withIcon: Bool) {
         super.init(frame: .zero); self.identifier = identifier
@@ -509,5 +541,5 @@ import AppKit
         ])
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    deinit { iconTask?.cancel() }
+    deinit { iconTask?.cancel(); dateTask?.cancel() }
 }
